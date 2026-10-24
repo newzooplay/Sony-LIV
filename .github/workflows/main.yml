@@ -1,3 +1,4 @@
+
 name: sonyliv-auto-update
 
 on:
@@ -16,68 +17,106 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+
     env:
       PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
-      - name: Install requests
-        run: python -m pip install --upgrade pip requests
-
-      - name: Verify files are present
+      - name: Install dependencies
         run: |
-          pwd
-          ls -la
-          test -f scraper.py || { echo "::error::scraper.py not found at repo root"; exit 1; }
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt
+          else
+            python -m pip install requests
+          fi
 
-      - name: Selftest (probe only)
+      - name: Verify required files
+        run: |
+          echo "Repository: $GITHUB_WORKSPACE"
+          ls -la
+          test -f scraper.py || {
+            echo "::error::scraper.py not found at repository root"
+            exit 1
+          }
+
+      - name: Show scraper arguments
+        run: python scraper.py --help
+
+      - name: Selftest
         id: selftest
         continue-on-error: true
         run: python scraper.py --selftest --verbose
 
       - name: Build playlist
         id: build
-        run: python scraper.py -o sonyliv.m3u --check --prune --live --verbose
+        run: |
+          python scraper.py \
+            -o sonyliv.m3u \
+            --check \
+            --prune \
+            --live \
+            --verbose
 
-      - name: Report
+          test -s sonyliv.m3u || {
+            echo "::error::Playlist is missing or empty"
+            exit 1
+          }
+
+          echo "Playlist created successfully"
+          echo "Entries: $(grep -c '^#EXTINF' sonyliv.m3u || true)"
+
+      - name: Prepare debug report
         if: always()
         run: |
-          echo "selftest : ${{ steps.selftest.outcome }}"
-          echo "build    : ${{ steps.build.outcome }}"
+          echo "Selftest: ${{ steps.selftest.outcome }}"
+          echo "Build: ${{ steps.build.outcome }}"
+
           if [ -f sonyliv.m3u ]; then
-            echo "entries  : $(grep -c '^#EXTINF' sonyliv.m3u)"
+            echo "Playlist size: $(wc -c < sonyliv.m3u) bytes"
             grep '^# Token exp' sonyliv.m3u || true
           fi
+
           if [ -f sonyliv.debug.json ]; then
-            echo "--- debug ---"
-            cat sonyliv.debug.json
+            echo "Debug JSON found"
           fi
 
-      - name: Commit if changed
+      - name: Commit playlist if changed
+        if: success()
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add sonyliv.m3u
-          if git diff --staged --quiet; then
-            echo "no change"
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- sonyliv.m3u
+
+          if git diff --cached --quiet; then
+            echo "Playlist unchanged; no commit needed."
           else
-            git commit -m "auto: refresh sonyliv token [$(date -u +%FT%TZ)]"
+            git commit -m "auto: refresh SonyLIV playlist [$(date -u +%FT%TZ)]"
             git push
           fi
 
       - name: Upload debug on failure
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: sonyliv-debug
           path: |
             sonyliv.m3u
             sonyliv.debug.json
           if-no-files-found: ignore
+          retention-days: 7
