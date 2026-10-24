@@ -1,25 +1,68 @@
 name: sonyliv-auto-update
+
 on:
   schedule:
-    - cron: "0 */4 * * *"      # every 4 hours; token lives ~12h so this is plenty
+    - cron: "17 */3 * * *"      # every 3h; token lives ~12h, so plenty of slack
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Force a fresh token mint"
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
+concurrency:
+  group: sonyliv-update
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
-      - run: pip install requests
-      - run: python scraper.py -o sonyliv.m3u --check
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Self-test (mint + verify, writes nothing)
+        run: python scraper.py --selftest
+
+      - name: Build playlist
+        run: |
+          FLAGS="--check --prune --live"
+          if [ "${{ inputs.force }}" = "true" ]; then FLAGS="$FLAGS --force"; fi
+          python scraper.py -o sonyliv.m3u $FLAGS
+
+      - name: Show result
+        run: |
+          echo "channels: $(grep -c '^#EXTINF' sonyliv.m3u)"
+          grep '^# Token exp' sonyliv.m3u
+
       - name: Commit if changed
         run: |
           git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add sonyliv.m3u
-          git diff --staged --quiet || git commit -m "auto: refresh sonyliv token $(date -u +%FT%TZ)"
-          git push
+          if git diff --staged --quiet; then
+            echo "no change"
+          else
+            git commit -m "auto: refresh sonyliv token [$(date -u +%FT%TZ)]"
+            git push
+          fi
+
+      - name: Upload playlist on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonyliv-debug
+          path: sonyliv.m3u
+          if-no-files-found: ignore
