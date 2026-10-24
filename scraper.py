@@ -2,15 +2,19 @@
 """
 SonyLIV -> auto-updating IPTV playlist (M3U). Free tier, no login, no premium.
 
-Design rule: NEVER fail the job while a usable playlist can still be produced.
-Exit 0 whenever something was written. Exit 1 only if nothing could be.
+Token acquisition is multi-strategy. Strategies are tried in order and the
+first token that actually verifies against the CDN wins:
+
+  A. apiv2 AGL VIDEOURL  -- 4 known-good donor assets x region x version
+  B. sonyliv.com v4 web API  -- hlsUrl token from a live asset
+  C. live-tv page scrape    -- any hdnea/hdntl string in the HTML
+  D. community worker feed  -- last resort, also reveals current CDN host
+
+HTTP errors are read from the BODY, never guessed from the status code.
 
 USAGE
-    python scraper.py                          # write sonyliv.m3u
-    python scraper.py --check --prune --live   # full CI run
-    python scraper.py --selftest               # probe only, writes nothing
-    python scraper.py --verbose                # per-channel diagnostics
-    python scraper.py --strict                 # hard-fail on zero healthy channels
+    python scraper.py --selftest --diag     # diagnose token acquisition
+    python scraper.py -o sonyliv.m3u --check --prune --live
 """
 
 from __future__ import annotations
@@ -37,37 +41,48 @@ except ImportError:
 API_BASE   = "https://apiv2.sonyliv.com"
 SITE       = "https://www.sonyliv.com"
 TOKEN_PATH = "/AGL/1.4/A/ENG/WEB/ALL/GETTOKEN"
-URL_PATH   = "/AGL/1.5/A/ENG/WEB/IN/CONTENT/VIDEOURL/VOD/{asset}"
-
 CDN_HOSTS = [
     "https://dishmt.slivcdn.com",
     "https://slivcdn.com",
     "https://sonylivmt.slivcdn.com",
 ]
 
-DONOR_ASSETS = ["1000022678", "1000027071", "1000026763", "1000024210"]
+# Known-good VOD assets (taken from yt-dlp's SonyLIV test cases -- far more
+# reliable than guessing ids out of image paths). Tried in order.
+DONOR_ASSETS = ["1000022678", "1000050121", "1000018779", "1000098925"]
+
+# (region, api-version) combos for the VIDEOURL endpoint, best first.
+REGION_VERSION = [("IN", "1.5"), ("IN", "1.6"), ("ALL", "1.5"),
+                  ("IN", "1.4"), ("ALL", "1.6")]
+
+WORKER_FEEDS = ["https://sliv.gramnaters.workers.dev/playlist.m3u"]
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
-BASE_HEADERS = {
+# apiv2 wants a plain JSON accept + referer. No Origin (matches yt-dlp, and
+# Akamai bot detection is pickier when extra headers are present).
+API_HEADERS = {
     "User-Agent": UA,
-    "Referer":    SITE + "/",
-    "Origin":     SITE,
-    "Accept":     "*/*",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": SITE,
+}
+WEB_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "*/*",
+    "Referer": SITE + "/",
+    "Origin": SITE,
 }
 
 GROUP        = "SonyLIV"
 REUSE_MARGIN = 3 * 3600
-HTTP_TIMEOUT = 12          # keep short: probes run 16-wide
+HTTP_TIMEOUT = 10
 IST          = timezone(timedelta(hours=5, minutes=30))
 DEBUG_FILE   = "sonyliv.debug.json"
 
 VERBOSE = False
+DIAG    = False
 
-# --------------------------------------------------------------------------- #
-# channel map  ->  (tvg-id, name, category, language, cdn path)
-# --------------------------------------------------------------------------- #
 CHANNELS = [
     ("sony-hd",       "SONY HD",       "Entertainment", "Hindi",   "2011671/SETHD"),
     ("sab-hd",        "SAB HD",        "Entertainment", "Hindi",   "2011749/SABHD"),
@@ -93,7 +108,7 @@ CHANNELS = [
     ("bbc-earth",     "BBC EARTH",     "Infotainment",  "English", "2011907/SonyBBCEarthHD"),
 ]
 
-TOKEN_RE = re.compile(r"\b(hdn(?:ea|tl))=([^&\s\"']+)")
+TOKEN_RE = re.compile(r"\b(hdn(?:ea|tl))=([^&\s\"'<>]+)")
 DEBUG: dict = {}
 
 
@@ -102,29 +117,31 @@ def log(msg: str) -> None:
 
 
 def vlog(msg: str) -> None:
-    if VERBOSE:
+    if VERBOSE or DIAG:
         print(msg, flush=True)
 
 
 # --------------------------------------------------------------------------- #
-# low-level http (thread-safe: no shared Session)
+# http helpers
 # --------------------------------------------------------------------------- #
-def _get(url: str, cookie: str | None = None, timeout: int = HTTP_TIMEOUT):
-    headers = dict(BASE_HEADERS)
+def _get(url, headers=None, cookie=None, timeout=HTTP_TIMEOUT):
+    h = dict(headers or API_HEADERS)
     if cookie:
-        headers["Cookie"] = cookie
-    return requests.get(url, headers=headers, timeout=timeout)
+        h["Cookie"] = cookie
+    r = requests.get(url, headers=h, timeout=timeout)
+    if DIAG:
+        vlog(f"    GET {url} -> {r.status_code} {r.text[:140]!r}")
+    return r
 
 
-def _post(url: str, payload: dict, timeout: int = HTTP_TIMEOUT):
-    headers = dict(BASE_HEADERS)
-    headers["Content-Type"] = "application/json"
-    return requests.post(url, json=payload, headers=headers, timeout=timeout)
+def _post(url, payload, timeout=HTTP_TIMEOUT):
+    r = requests.post(url, json=payload, headers={**WEB_HEADERS,
+                     "Content-Type": "application/json"}, timeout=timeout)
+    if DIAG:
+        vlog(f"    POST {url} -> {r.status_code} {r.text[:140]!r}")
+    return r
 
 
-# --------------------------------------------------------------------------- #
-# token
-# --------------------------------------------------------------------------- #
 def parse_token(raw: str):
     m = TOKEN_RE.search(raw or "")
     return (m.group(1), m.group(2)) if m else None
@@ -135,89 +152,60 @@ def token_expiry(value: str) -> int:
     return int(m.group(1)) if m else 0
 
 
-def mint_token(retries: int = 3):
-    for attempt in range(1, retries + 1):
-        try:
-            r = _get(API_BASE + TOKEN_PATH)
-            r.raise_for_status()
-            jwt = (r.json() or {}).get("resultObj")
-            if not isinstance(jwt, str) or not jwt:
-                raise ValueError(f"GETTOKEN gave no JWT (HTTP {r.status_code})")
-
-            asset = random.choice(DONOR_ASSETS)
-            r2 = requests.get(
-                API_BASE + URL_PATH.format(asset=asset),
-                headers={**BASE_HEADERS, "security_token": jwt},
-                timeout=HTTP_TIMEOUT,
-            )
-            r2.raise_for_status()
-            vurl = ((r2.json() or {}).get("resultObj") or {}).get("videoURL") or ""
-
-            parsed = parse_token(vurl)
-            if not parsed:
-                raise ValueError(f"no edge-auth token in videoURL: {vurl[:110]!r}")
-            DEBUG["donor_asset"] = asset
-            return parsed
-        except Exception as exc:
-            log(f"  ! mint {attempt}/{retries}: {exc}")
-            if attempt < retries:
-                time.sleep(2 * attempt)
-    return None
-
-
-def cached_token(path: str):
-    if not os.path.exists(path):
-        return None
+def body_msg(resp) -> str:
+    """Pull the human message out of an error body instead of guessing."""
     try:
-        return parse_token(open(path, encoding="utf-8").read())
-    except OSError:
-        return None
-
-
-def verify(name: str, value: str, host: str, path: str) -> bool:
-    try:
-        r = _get(f"{host}/hls/live/{path}/master.m3u8?{name}={value}",
-                 cookie=f"{name}={value}")
-        return r.status_code == 200 and "#EXTM3U" in r.text
+        data = resp.json()
+        for key in ("message", "errorMessage", "resultObj", "error"):
+            if isinstance(data.get(key), str):
+                return data[key]
+        return json.dumps(data)[:150]
     except Exception:
-        return False
+        return (resp.text or "")[:150].replace("\n", " ")
 
 
 # --------------------------------------------------------------------------- #
-# CDN + channel health (threaded)
+# strategies  ->  return ((token_name, token_value), host_or_None) | None
 # --------------------------------------------------------------------------- #
-def pick_cdn(name: str, value: str):
-    """A host is good if ANY of 3 spread-out probe channels answers."""
-    probes = [CHANNELS[0], CHANNELS[len(CHANNELS) // 2], CHANNELS[-1]]
-    for host in CDN_HOSTS:
-        hits = sum(verify(name, value, host, c[4]) for c in probes)
-        DEBUG.setdefault("cdn_probe", {})[host] = f"{hits}/{len(probes)}"
-        if hits:
-            log(f"  CDN ok: {host} ({hits}/{len(probes)} probes)")
-            return host
-        log(f"  CDN dead: {host} (0/{len(probes)} probes)")
+def strat_apiv2():
+    r = _get(API_BASE + TOKEN_PATH)
+    if r.status_code != 200:
+        log(f"  [apiv2] GETTOKEN -> {r.status_code} {body_msg(r)}")
+        return None
+    jwt = (r.json() or {}).get("resultObj")
+    if not isinstance(jwt, str) or not jwt:
+        log(f"  [apiv2] GETTOKEN had no resultObj")
+        return None
+
+    last = None
+    for asset in DONOR_ASSETS:
+        for region, ver in REGION_VERSION:
+            url = f"{API_BASE}/AGL/{ver}/A/ENG/WEB/{region}/CONTENT/VIDEOURL/VOD/{asset}"
+            try:
+                rr = _get(url, headers={**API_HEADERS, "security_token": jwt})
+            except Exception as exc:
+                last = f"{asset} {region}/{ver}: {exc}"
+                continue
+            if rr.status_code == 200:
+                vurl = ((rr.json() or {}).get("resultObj") or {}).get("videoURL") or ""
+                tok = parse_token(vurl)
+                if tok:
+                    log(f"  [apiv2] ok via {asset} {region}/v{ver}")
+                    DEBUG["apiv2_asset"] = asset
+                    return tok, None
+                last = f"{asset} {region}/{ver}: no token in videoURL"
+            else:
+                last = f"{asset} {region}/v{ver}: {rr.status_code} {body_msg(rr)}"
+                vlog(f"    {last}")
+    log(f"  [apiv2] all combos failed. last: {last}")
+    DEBUG["apiv2_last_error"] = last
     return None
 
 
-def health_check(name: str, value: str, host: str, workers: int = 16):
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        results = list(ex.map(
-            lambda ch: (ch, verify(name, value, host, ch[4])), CHANNELS))
-    alive = [ch for ch, ok in results if ok]
-    dead = [ch for ch, ok in results if not ok]
-    DEBUG["health"] = {"alive": len(alive), "dead": [c[1] for c in dead]}
-    for ch in dead:
-        vlog(f"  dead: {ch[1]}")
-    return alive
-
-
-# --------------------------------------------------------------------------- #
-# live events (best effort)
-# --------------------------------------------------------------------------- #
 SEARCH_BODY = {
     "detailsType": "basic",
     "searchSet": [{
-        "pageSize": 60, "pageNumber": 0, "sortOrder": "START_DATE:DESC",
+        "pageSize": 40, "pageNumber": 0, "sortOrder": "START_DATE:DESC",
         "data": "all=classification:channel&all=type:live",
         "type": "search", "id": "live_channels", "itemsUsed": 0, "language": "",
     }],
@@ -228,32 +216,159 @@ SEARCH_BODY = {
 }
 
 
-def fetch_live_events():
-    try:
-        r = _post(SITE + "/api/v4/vod/search", SEARCH_BODY)
-        r.raise_for_status()
-        payload = r.json() or {}
-    except Exception as exc:
-        log(f"  ! live search skipped: {exc}")
-        return []
-
+def strat_web_v4():
+    r = _post(SITE + "/api/v4/vod/search", SEARCH_BODY)
+    if r.status_code != 200:
+        log(f"  [v4] search -> {r.status_code} {body_msg(r)}")
+        return None
+    payload = r.json() or {}
     node = payload.get("0") or payload
     ids = [i["id"] for i in (node.get("assets") or []) if i.get("id")]
+    if not ids:
+        log("  [v4] search returned no assets")
+        return None
 
-    out = []
-    for asset_id in ids[:25]:
+    for asset_id in ids[:8]:
         try:
             rr = _post(SITE + "/api/v4/vod/asset/details", {
                 "detailsType": "all", "isDetailedView": True,
                 "asset_ids": str(asset_id),
                 "deviceDetails": SEARCH_BODY["deviceDetails"],
             })
-            rr.raise_for_status()
-            details = rr.json()["assets"][0]["details"]
-            url = re.sub(r"\s", "", details.get("hlsUrl") or "")
-            title = details.get("channel") or details.get("showname") or str(asset_id)
+            details = (rr.json()["assets"][0])["details"]
+            tok = parse_token(details.get("hlsUrl") or "")
+            if tok:
+                log(f"  [v4] ok via asset {asset_id}")
+                return tok, None
+        except Exception:
+            continue
+    log("  [v4] no token from any live asset")
+    return None
+
+
+def strat_page():
+    for path in ("/live-tv", "/"):
+        try:
+            r = _get(SITE + path, headers=WEB_HEADERS)
+        except Exception:
+            continue
+        if r.status_code == 200:
+            tok = parse_token(r.text)
+            if tok:
+                log(f"  [page] ok from {path}")
+                return tok, None
+    log("  [page] no token in HTML")
+    return None
+
+
+def strat_worker():
+    for feed in WORKER_FEEDS:
+        try:
+            r = _get(feed, headers=WEB_HEADERS)
+        except Exception as exc:
+            log(f"  [worker] {exc}")
+            continue
+        if r.status_code != 200:
+            log(f"  [worker] {feed} -> {r.status_code}")
+            continue
+        for line in r.text.splitlines():
+            line = line.strip()
+            if not line.startswith("http"):
+                continue
+            m = re.match(r"(https://[^/]+).*?\b(hdn(?:ea|tl))=([^&\s]+)", line)
+            if m:
+                log(f"  [worker] ok, host={m.group(1)}")
+                return (m.group(2), m.group(3)), m.group(1)
+    log("  [worker] no usable feed")
+    return None
+
+
+STRATEGIES = [("apiv2", strat_apiv2), ("web_v4", strat_web_v4),
+              ("page", strat_page), ("worker", strat_worker)]
+
+
+# --------------------------------------------------------------------------- #
+# CDN + verification
+# --------------------------------------------------------------------------- #
+def verify(name: str, value: str, host: str, path: str) -> bool:
+    try:
+        r = _get(f"{host}/hls/live/{path}/master.m3u8?{name}={value}",
+                 headers=WEB_HEADERS, cookie=f"{name}={value}")
+        return r.status_code == 200 and "#EXTM3U" in r.text
+    except Exception:
+        return False
+
+
+def _works(name: str, value: str) -> bool:
+    probes = [CHANNELS[0], CHANNELS[len(CHANNELS) // 2]]
+    return any(verify(name, value, h, c[4]) for h in CDN_HOSTS for c in probes)
+
+
+def pick_cdn(name: str, value: str):
+    probes = [CHANNELS[0], CHANNELS[len(CHANNELS) // 2], CHANNELS[-1]]
+    for host in CDN_HOSTS:
+        hits = sum(verify(name, value, host, c[4]) for c in probes)
+        DEBUG.setdefault("cdn_probe", {})[host] = f"{hits}/{len(probes)}"
+        if hits:
+            log(f"  CDN ok: {host} ({hits}/{len(probes)})")
+            return host
+        log(f"  CDN dead: {host} (0/{len(probes)})")
+    return None
+
+
+def acquire() -> tuple[str, str, str] | None:
+    for label, fn in STRATEGIES:
+        try:
+            res = fn()
+        except Exception as exc:
+            log(f"  [{label}] crashed: {exc}")
+            continue
+        if not res:
+            continue
+        (name, value), host = res
+        host = host or pick_cdn(name, value)
+        if host and _works(name, value):
+            log(f"  ACCEPTED via {label}")
+            DEBUG["strategy"] = label
+            DEBUG["cdn"] = host
+            return name, value, host
+        log(f"  [{label}] token did not verify on CDN")
+    return None
+
+
+def health_check(name, value, host, workers=16):
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(lambda ch: (ch, verify(name, value, host, ch[4])),
+                              CHANNELS))
+    alive = [ch for ch, ok in results if ok]
+    dead = [ch for ch, ok in results if not ok]
+    DEBUG["health"] = {"alive": len(alive), "dead": [c[1] for c in dead]}
+    for ch in dead:
+        vlog(f"  dead: {ch[1]}")
+    return alive
+
+
+def fetch_live_events():
+    try:
+        r = _post(SITE + "/api/v4/vod/search", SEARCH_BODY)
+        payload = r.json() or {}
+    except Exception as exc:
+        log(f"  live search skipped: {exc}")
+        return []
+    node = payload.get("0") or payload
+    ids = [i["id"] for i in (node.get("assets") or []) if i.get("id")]
+    out = []
+    for asset_id in ids[:20]:
+        try:
+            rr = _post(SITE + "/api/v4/vod/asset/details", {
+                "detailsType": "all", "isDetailedView": True,
+                "asset_ids": str(asset_id),
+                "deviceDetails": SEARCH_BODY["deviceDetails"],
+            })
+            d = rr.json()["assets"][0]["details"]
+            url = re.sub(r"\s", "", d.get("hlsUrl") or "")
             if url.startswith("http"):
-                out.append((f"{title} [live]", url))
+                out.append((f"{d.get('channel') or d.get('showname') or asset_id} [live]", url))
         except Exception:
             continue
     log(f"  live events: {len(out)}")
@@ -271,6 +386,7 @@ def build(channels, name, value, host, live, out):
         f"# Token exp  : {datetime.fromtimestamp(exp, IST):%d %b %Y, %H:%M:%S IST}"
         if exp else "# Token exp  : unknown",
         f"# CDN host   : {host}",
+        f"# Source     : {DEBUG.get('strategy', '?')}",
         f"# Channels   : {len(channels)}" + (f" + {len(live)} live" if live else ""),
         "",
     ]
@@ -298,10 +414,10 @@ def build(channels, name, value, host, live, out):
     atomic_write(out, "\n".join(lines).rstrip() + "\n")
 
 
-def atomic_write(path: str, text: str) -> None:
-    directory = os.path.dirname(os.path.abspath(path))
-    os.makedirs(directory, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+def atomic_write(path, text):
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -312,7 +428,7 @@ def atomic_write(path: str, text: str) -> None:
         raise
 
 
-def dump_debug() -> None:
+def dump_debug():
     try:
         DEBUG["when"] = datetime.now(IST).isoformat()
         with open(DEBUG_FILE, "w", encoding="utf-8") as fh:
@@ -325,9 +441,9 @@ def dump_debug() -> None:
 # main
 # --------------------------------------------------------------------------- #
 def main() -> int:
-    global VERBOSE
+    global VERBOSE, DIAG
 
-    ap = argparse.ArgumentParser(description="SonyLIV auto-updating M3U builder")
+    ap = argparse.ArgumentParser()
     ap.add_argument("-o", "--out", default="sonyliv.m3u")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--check", action="store_true")
@@ -336,74 +452,67 @@ def main() -> int:
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--strict", action="store_true")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--diag", action="store_true", help="print raw HTTP bodies")
     args = ap.parse_args()
 
-    VERBOSE = args.verbose
-    log(f"SonyLIV builder  python {sys.version.split()[0]}  cwd={os.getcwd()}")
+    VERBOSE, DIAG = args.verbose, args.diag
+    log(f"SonyLIV builder  py{sys.version.split()[0]}  cwd={os.getcwd()}")
 
-    # ---- token ------------------------------------------------------------
     token = None
     if not args.force:
-        token = cached_token(args.out)
-        if token:
-            left = token_expiry(token[1]) - time.time()
+        m = re.search(r"hdn(?:ea|tl)=[^\s\"']+", open(args.out, encoding="utf-8").read()) \
+            if os.path.exists(args.out) else None
+        if m:
+            tok = parse_token(m.group(0))
+            left = token_expiry(tok[1]) - time.time() if tok else 0
             if left > REUSE_MARGIN:
                 log(f"Reusing cached token ({left / 3600:.1f}h left)")
+                token = tok
             else:
                 log(f"Cached token {left / 3600:.1f}h left -> re-mint")
-                token = None
 
     if token is None:
-        log("Minting fresh token...")
-        token = mint_token()
-        if token is None:
+        log("Acquiring token...")
+        got = acquire()
+        if got is None:
             dump_debug()
-            log("FAILED: no token. Existing playlist untouched.")
+            log("FAILED: no strategy produced a working token.")
             return 1
-        log(f"  got {token[0]}={token[1][:40]}...")
+        name, value, host = got
+    else:
+        name, value = token
+        host = pick_cdn(name, value)
+        if host is None:
+            dump_debug()
+            log("FAILED: cached token no longer valid on any CDN.")
+            return 1
 
-    name, value = token
     DEBUG["token_name"] = name
     DEBUG["token_exp"] = token_expiry(value)
 
-    # ---- CDN --------------------------------------------------------------
-    host = pick_cdn(name, value)
-    if host is None:
-        dump_debug()
-        log("FAILED: token verified on no CDN host.")
-        return 1
-
     if args.selftest:
         dump_debug()
-        log(f"Selftest OK -- token valid until "
-            f"{datetime.fromtimestamp(token_expiry(value), IST):%d %b %H:%M} IST")
+        log(f"Selftest OK -- {datetime.fromtimestamp(token_expiry(value), IST):%d %b %H:%M} IST")
         return 0
 
-    # ---- health (optional, threaded, non-fatal) ---------------------------
     channels = CHANNELS
     if args.check or args.prune:
-        log("Health-checking channels (threaded)...")
+        log("Health-checking channels...")
         alive = health_check(name, value, host)
         if not alive:
-            log(f"  WARNING: 0/{len(CHANNELS)} healthy. Writing full list anyway.")
+            log(f"  WARNING 0/{len(CHANNELS)} healthy, writing full list")
             if args.strict:
                 dump_debug()
                 return 1
         elif args.prune:
             channels = alive
             log(f"  pruned to {len(alive)}/{len(CHANNELS)}")
-        else:
-            log(f"  {len(alive)}/{len(CHANNELS)} healthy (no prune)")
 
-    # ---- live -------------------------------------------------------------
     live = fetch_live_events() if args.live else []
-
-    # ---- write ------------------------------------------------------------
     build(channels, name, value, host, live, args.out)
     dump_debug()
-    exp = datetime.fromtimestamp(token_expiry(value), IST)
     log(f"OK -> {args.out}  entries={len(channels) + len(live)}  "
-        f"token_valid_until={exp:%d %b %H:%M} IST")
+        f"valid_until={datetime.fromtimestamp(token_expiry(value), IST):%d %b %H:%M} IST")
     return 0
 
 
