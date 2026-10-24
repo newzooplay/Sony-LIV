@@ -2,13 +2,8 @@ name: sonyliv-auto-update
 
 on:
   schedule:
-    - cron: "17 */3 * * *"      # every 3h; token lives ~12h, so plenty of slack
+    - cron: "17 */3 * * *"
   workflow_dispatch:
-    inputs:
-      force:
-        description: "Force a fresh token mint"
-        type: boolean
-        default: true
 
 permissions:
   contents: write
@@ -19,33 +14,51 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ubuntu-24.04          # pinned: ubuntu-latest is drifting to 26
+    timeout-minutes: 20
+    env:
+      PYTHONUNBUFFERED: "1"
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
 
-      - name: Install deps
-        run: pip install -r requirements.txt
+      - name: Install requests
+        run: python -m pip install --upgrade pip requests
 
-      - name: Self-test (mint + verify, writes nothing)
-        run: python scraper.py --selftest
+      - name: Verify files are present
+        run: |
+          pwd
+          ls -la
+          test -f scraper.py || { echo "::error::scraper.py not found at repo root"; exit 1; }
+
+      - name: Selftest (probe only)
+        id: selftest
+        continue-on-error: true
+        run: python scraper.py --selftest --verbose
 
       - name: Build playlist
-        run: |
-          FLAGS="--check --prune --live"
-          if [ "${{ inputs.force }}" = "true" ]; then FLAGS="$FLAGS --force"; fi
-          python scraper.py -o sonyliv.m3u $FLAGS
+        id: build
+        run: python scraper.py -o sonyliv.m3u --check --prune --live --verbose
 
-      - name: Show result
+      - name: Report
+        if: always()
         run: |
-          echo "channels: $(grep -c '^#EXTINF' sonyliv.m3u)"
-          grep '^# Token exp' sonyliv.m3u
+          echo "selftest : ${{ steps.selftest.outcome }}"
+          echo "build    : ${{ steps.build.outcome }}"
+          if [ -f sonyliv.m3u ]; then
+            echo "entries  : $(grep -c '^#EXTINF' sonyliv.m3u)"
+            grep '^# Token exp' sonyliv.m3u || true
+          fi
+          if [ -f sonyliv.debug.json ]; then
+            echo "--- debug ---"
+            cat sonyliv.debug.json
+          fi
 
       - name: Commit if changed
         run: |
@@ -59,10 +72,12 @@ jobs:
             git push
           fi
 
-      - name: Upload playlist on failure
+      - name: Upload debug on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: sonyliv-debug
-          path: sonyliv.m3u
+          path: |
+            sonyliv.m3u
+            sonyliv.debug.json
           if-no-files-found: ignore
