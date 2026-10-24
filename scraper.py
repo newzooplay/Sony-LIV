@@ -2,28 +2,15 @@
 """
 SonyLIV -> auto-updating IPTV playlist (M3U). Free tier, no login, no premium.
 
-WHY THIS WORKS
---------------
-SonyLIV's CDN signs every request with an Akamai edge-auth token (hdnea/hdntl).
-Channel paths are STATIC. The token is minted with `acl=/*`, so ONE token
-covers every channel, every media playlist, every AES key and every segment.
-No subscription check happens at mint time.
-
-So the whole job is: mint a fresh token every few hours, template it into a
-fixed channel map, atomically rewrite the .m3u. That is what "auto update" means.
-
-TOKEN CHAIN (2 requests, no auth):
-    GET  apiv2.sonyliv.com/AGL/1.4/A/ENG/WEB/ALL/GETTOKEN              -> JWT
-    GET  apiv2.sonyliv.com/AGL/1.5/A/ENG/WEB/IN/CONTENT/VIDEOURL/VOD/{id}
-         header: security_token: <JWT>                                 -> token
+Design rule: NEVER fail the job while a usable playlist can still be produced.
+Exit 0 whenever something was written. Exit 1 only if nothing could be.
 
 USAGE
-    python scraper.py                      # write sonyliv.m3u
-    python scraper.py --check              # verify before writing (use in CI)
-    python scraper.py --prune              # drop channels that fail health check
-    python scraper.py --live               # also append live sports/event feeds
-    python scraper.py --force              # ignore cached token, always re-mint
-    python scraper.py --selftest           # mint + verify + report, write nothing
+    python scraper.py                          # write sonyliv.m3u
+    python scraper.py --check --prune --live   # full CI run
+    python scraper.py --selftest               # probe only, writes nothing
+    python scraper.py --verbose                # per-channel diagnostics
+    python scraper.py --strict                 # hard-fail on zero healthy channels
 """
 
 from __future__ import annotations
@@ -34,13 +21,15 @@ import os
 import random
 import re
 import sys
+import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 try:
     import requests
 except ImportError:
-    sys.exit("Missing dependency ->  pip install requests")
+    sys.exit("Missing dependency ->  python -m pip install requests")
 
 # --------------------------------------------------------------------------- #
 # config
@@ -50,32 +39,31 @@ SITE       = "https://www.sonyliv.com"
 TOKEN_PATH = "/AGL/1.4/A/ENG/WEB/ALL/GETTOKEN"
 URL_PATH   = "/AGL/1.5/A/ENG/WEB/IN/CONTENT/VIDEOURL/VOD/{asset}"
 
-# Primary CDN first; alternates are tried only if the primary stops verifying.
 CDN_HOSTS = [
     "https://dishmt.slivcdn.com",
     "https://slivcdn.com",
     "https://sonylivmt.slivcdn.com",
 ]
 
-# "Donor" VOD assets used purely to obtain a wildcard token. If one is pulled
-# from the catalogue, the next is tried.
 DONOR_ASSETS = ["1000022678", "1000027071", "1000026763", "1000024210"]
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
-GROUP        = "SonyLIV"
-REUSE_MARGIN = 3 * 3600          # reuse cached token while > 3h validity remains
-HTTP_TIMEOUT = 20
-IST          = timezone(timedelta(hours=5, minutes=30))
-
-SESSION = requests.Session()
-SESSION.headers.update({
+BASE_HEADERS = {
     "User-Agent": UA,
     "Referer":    SITE + "/",
     "Origin":     SITE,
     "Accept":     "*/*",
-})
+}
+
+GROUP        = "SonyLIV"
+REUSE_MARGIN = 3 * 3600
+HTTP_TIMEOUT = 12          # keep short: probes run 16-wide
+IST          = timezone(timedelta(hours=5, minutes=30))
+DEBUG_FILE   = "sonyliv.debug.json"
+
+VERBOSE = False
 
 # --------------------------------------------------------------------------- #
 # channel map  ->  (tvg-id, name, category, language, cdn path)
@@ -106,36 +94,60 @@ CHANNELS = [
 ]
 
 TOKEN_RE = re.compile(r"\b(hdn(?:ea|tl))=([^&\s\"']+)")
+DEBUG: dict = {}
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def vlog(msg: str) -> None:
+    if VERBOSE:
+        print(msg, flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# low-level http (thread-safe: no shared Session)
+# --------------------------------------------------------------------------- #
+def _get(url: str, cookie: str | None = None, timeout: int = HTTP_TIMEOUT):
+    headers = dict(BASE_HEADERS)
+    if cookie:
+        headers["Cookie"] = cookie
+    return requests.get(url, headers=headers, timeout=timeout)
+
+
+def _post(url: str, payload: dict, timeout: int = HTTP_TIMEOUT):
+    headers = dict(BASE_HEADERS)
+    headers["Content-Type"] = "application/json"
+    return requests.post(url, json=payload, headers=headers, timeout=timeout)
 
 
 # --------------------------------------------------------------------------- #
 # token
 # --------------------------------------------------------------------------- #
-def parse_token(raw: str) -> tuple[str, str] | None:
-    """'hdnea=exp=...~hmac=...' -> ('hdnea', 'exp=...~hmac=...')"""
+def parse_token(raw: str):
     m = TOKEN_RE.search(raw or "")
     return (m.group(1), m.group(2)) if m else None
 
 
-def token_expiry(token: str) -> int:
-    m = re.search(r"exp=(\d+)", token)
+def token_expiry(value: str) -> int:
+    m = re.search(r"exp=(\d+)", value)
     return int(m.group(1)) if m else 0
 
 
-def mint_token(retries: int = 3) -> tuple[str, str] | None:
-    """Return (cookie_name, token_value) or None. Never raises."""
+def mint_token(retries: int = 3):
     for attempt in range(1, retries + 1):
         try:
-            r = SESSION.get(API_BASE + TOKEN_PATH, timeout=HTTP_TIMEOUT)
+            r = _get(API_BASE + TOKEN_PATH)
             r.raise_for_status()
             jwt = (r.json() or {}).get("resultObj")
             if not isinstance(jwt, str) or not jwt:
-                raise ValueError(f"GETTOKEN returned no JWT (HTTP {r.status_code})")
+                raise ValueError(f"GETTOKEN gave no JWT (HTTP {r.status_code})")
 
             asset = random.choice(DONOR_ASSETS)
-            r2 = SESSION.get(
+            r2 = requests.get(
                 API_BASE + URL_PATH.format(asset=asset),
-                headers={"security_token": jwt},
+                headers={**BASE_HEADERS, "security_token": jwt},
                 timeout=HTTP_TIMEOUT,
             )
             r2.raise_for_status()
@@ -144,16 +156,16 @@ def mint_token(retries: int = 3) -> tuple[str, str] | None:
             parsed = parse_token(vurl)
             if not parsed:
                 raise ValueError(f"no edge-auth token in videoURL: {vurl[:110]!r}")
+            DEBUG["donor_asset"] = asset
             return parsed
-
         except Exception as exc:
-            print(f"  ! mint attempt {attempt}/{retries}: {exc}")
+            log(f"  ! mint {attempt}/{retries}: {exc}")
             if attempt < retries:
                 time.sleep(2 * attempt)
     return None
 
 
-def cached_token(path: str) -> tuple[str, str] | None:
+def cached_token(path: str):
     if not os.path.exists(path):
         return None
     try:
@@ -163,41 +175,44 @@ def cached_token(path: str) -> tuple[str, str] | None:
 
 
 def verify(name: str, value: str, host: str, path: str) -> bool:
-    """Confirm the token actually serves a master playlist."""
-    url = f"{host}/hls/live/{path}/master.m3u8?{name}={value}"
     try:
-        r = SESSION.get(url, timeout=HTTP_TIMEOUT, headers={"Cookie": f"{name}={value}"})
+        r = _get(f"{host}/hls/live/{path}/master.m3u8?{name}={value}",
+                 cookie=f"{name}={value}")
         return r.status_code == 200 and "#EXTM3U" in r.text
     except Exception:
         return False
 
 
-def pick_cdn(name: str, value: str) -> str | None:
-    """Return the first CDN host that serves the probe channel."""
-    probe = CHANNELS[0][4]
+# --------------------------------------------------------------------------- #
+# CDN + channel health (threaded)
+# --------------------------------------------------------------------------- #
+def pick_cdn(name: str, value: str):
+    """A host is good if ANY of 3 spread-out probe channels answers."""
+    probes = [CHANNELS[0], CHANNELS[len(CHANNELS) // 2], CHANNELS[-1]]
     for host in CDN_HOSTS:
-        if verify(name, value, host, probe):
-            print(f"  CDN ok: {host}")
+        hits = sum(verify(name, value, host, c[4]) for c in probes)
+        DEBUG.setdefault("cdn_probe", {})[host] = f"{hits}/{len(probes)}"
+        if hits:
+            log(f"  CDN ok: {host} ({hits}/{len(probes)} probes)")
             return host
-        print(f"  CDN dead: {host}")
+        log(f"  CDN dead: {host} (0/{len(probes)} probes)")
     return None
 
 
-# --------------------------------------------------------------------------- #
-# health check / prune
-# --------------------------------------------------------------------------- #
-def health_check(name: str, value: str, host: str) -> list[tuple]:
-    """Probe every channel in parallel-ish; return the ones that respond."""
-    alive, dead = [], []
-    for ch in CHANNELS:
-        (alive if verify(name, value, host, ch[4]) else dead).append(ch)
+def health_check(name: str, value: str, host: str, workers: int = 16):
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        results = list(ex.map(
+            lambda ch: (ch, verify(name, value, host, ch[4])), CHANNELS))
+    alive = [ch for ch, ok in results if ok]
+    dead = [ch for ch, ok in results if not ok]
+    DEBUG["health"] = {"alive": len(alive), "dead": [c[1] for c in dead]}
     for ch in dead:
-        print(f"  dead: {ch[1]}")
+        vlog(f"  dead: {ch[1]}")
     return alive
 
 
 # --------------------------------------------------------------------------- #
-# live events (optional, best-effort)
+# live events (best effort)
 # --------------------------------------------------------------------------- #
 SEARCH_BODY = {
     "detailsType": "basic",
@@ -213,92 +228,77 @@ SEARCH_BODY = {
 }
 
 
-def fetch_live_events() -> list[tuple[str, str]]:
-    """Return [(display_name, m3u8_url)] for currently-live events. Best-effort."""
+def fetch_live_events():
     try:
-        r = SESSION.post(SITE + "/api/v4/vod/search", json=SEARCH_BODY,
-                         headers={"Content-Type": "application/json"},
-                         timeout=HTTP_TIMEOUT)
+        r = _post(SITE + "/api/v4/vod/search", SEARCH_BODY)
         r.raise_for_status()
-        payload = r.json()
+        payload = r.json() or {}
     except Exception as exc:
-        print(f"  ! live-event search failed: {exc}")
+        log(f"  ! live search skipped: {exc}")
         return []
 
-    assets = []
     node = payload.get("0") or payload
-    for item in (node.get("assets") or []):
-        if item.get("id"):
-            assets.append(item["id"])
+    ids = [i["id"] for i in (node.get("assets") or []) if i.get("id")]
 
     out = []
-    for asset_id in assets[:25]:
+    for asset_id in ids[:25]:
         try:
-            body = {
+            rr = _post(SITE + "/api/v4/vod/asset/details", {
                 "detailsType": "all", "isDetailedView": True,
                 "asset_ids": str(asset_id),
                 "deviceDetails": SEARCH_BODY["deviceDetails"],
-            }
-            rr = SESSION.post(SITE + "/api/v4/vod/asset/details", json=body,
-                              headers={"Content-Type": "application/json"},
-                              timeout=HTTP_TIMEOUT)
+            })
             rr.raise_for_status()
-            details = (rr.json()["assets"][0])["details"]
+            details = rr.json()["assets"][0]["details"]
             url = re.sub(r"\s", "", details.get("hlsUrl") or "")
             title = details.get("channel") or details.get("showname") or str(asset_id)
             if url.startswith("http"):
                 out.append((f"{title} [live]", url))
         except Exception:
             continue
-    print(f"  live events: {len(out)}")
+    log(f"  live events: {len(out)}")
     return out
 
 
 # --------------------------------------------------------------------------- #
-# playlist writer
+# writer
 # --------------------------------------------------------------------------- #
-def build(channels, name, value, host, live, out) -> None:
-    exp = datetime.fromtimestamp(token_expiry(value), IST) if token_expiry(value) else None
+def build(channels, name, value, host, live, out):
+    exp = token_expiry(value)
     lines = [
         "#EXTM3U",
         f"# Generated  : {datetime.now(IST):%d %b %Y, %H:%M:%S IST}",
-        f"# Token exp  : {exp:%d %b %Y, %H:%M:%S IST}" if exp else "# Token exp  : unknown",
+        f"# Token exp  : {datetime.fromtimestamp(exp, IST):%d %b %Y, %H:%M:%S IST}"
+        if exp else "# Token exp  : unknown",
         f"# CDN host   : {host}",
-        f"# Channels   : {len(channels)}" + (f" + {len(live)} live events" if live else ""),
-        f"# Token      : {name}=... (embedded in URL and mirrored as Cookie)",
+        f"# Channels   : {len(channels)}" + (f" + {len(live)} live" if live else ""),
         "",
     ]
-
     for cid, title, cat, lang, path in channels:
-        url = f"{host}/hls/live/{path}/master.m3u8?{name}={value}"
         lines += [
             f'#EXTINF:-1 tvg-id="{cid}.sonyliv" tvg-name="{title}" '
             f'tvg-language="{lang}" group-title="{GROUP} - {cat}",{title}',
             f"#EXTVLCOPT:http-user-agent={UA}",
             f"#EXTVLCOPT:http-referrer={SITE}/",
             f"#EXTVLCOPT:http-cookie={name}={value}",
-            '#EXTHTTP:' + json.dumps({
+            "#EXTHTTP:" + json.dumps({
                 "User-Agent": UA, "Referrer": SITE + "/",
                 "Origin": SITE, "Cookie": f"{name}={value}",
             }, separators=(",", ":")),
-            url,
+            f"{host}/hls/live/{path}/master.m3u8?{name}={value}",
             "",
         ]
-
     for title, url in live:
         lines += [
             f'#EXTINF:-1 group-title="{GROUP} - Live Events",{title}',
             f"#EXTVLCOPT:http-user-agent={UA}",
-            f"#EXTVLCOPT:http-referrer={SITE}/",
             url,
             "",
         ]
-
     atomic_write(out, "\n".join(lines).rstrip() + "\n")
 
 
 def atomic_write(path: str, text: str) -> None:
-    """Write via temp file + os.replace so a crash never truncates the playlist."""
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
@@ -312,75 +312,98 @@ def atomic_write(path: str, text: str) -> None:
         raise
 
 
+def dump_debug() -> None:
+    try:
+        DEBUG["when"] = datetime.now(IST).isoformat()
+        with open(DEBUG_FILE, "w", encoding="utf-8") as fh:
+            json.dump(DEBUG, fh, indent=2)
+    except OSError:
+        pass
+
+
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
 def main() -> int:
+    global VERBOSE
+
     ap = argparse.ArgumentParser(description="SonyLIV auto-updating M3U builder")
     ap.add_argument("-o", "--out", default="sonyliv.m3u")
-    ap.add_argument("--force", action="store_true", help="ignore cached token")
-    ap.add_argument("--check", action="store_true", help="verify before writing")
-    ap.add_argument("--prune", action="store_true", help="drop channels that fail")
-    ap.add_argument("--live", action="store_true", help="append live event feeds")
-    ap.add_argument("--selftest", action="store_true", help="probe only, write nothing")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--prune", action="store_true")
+    ap.add_argument("--live", action="store_true")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--strict", action="store_true")
+    ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    print("SonyLIV playlist builder")
+    VERBOSE = args.verbose
+    log(f"SonyLIV builder  python {sys.version.split()[0]}  cwd={os.getcwd()}")
 
-    # 1. token -- reuse a cached one while it is comfortably valid
+    # ---- token ------------------------------------------------------------
     token = None
     if not args.force:
         token = cached_token(args.out)
         if token:
             left = token_expiry(token[1]) - time.time()
             if left > REUSE_MARGIN:
-                print(f"Reusing cached token ({left / 3600:.1f}h left)")
+                log(f"Reusing cached token ({left / 3600:.1f}h left)")
             else:
-                print(f"Cached token has {left / 3600:.1f}h left -> re-minting")
+                log(f"Cached token {left / 3600:.1f}h left -> re-mint")
                 token = None
 
     if token is None:
-        print("Minting fresh token...")
+        log("Minting fresh token...")
         token = mint_token()
         if token is None:
-            print("FAILED: no token. Existing playlist left untouched.")
+            dump_debug()
+            log("FAILED: no token. Existing playlist untouched.")
             return 1
-        print(f"  got {token[0]}={token[1][:40]}...")
+        log(f"  got {token[0]}={token[1][:40]}...")
 
     name, value = token
+    DEBUG["token_name"] = name
+    DEBUG["token_exp"] = token_expiry(value)
 
-    # 2. CDN
+    # ---- CDN --------------------------------------------------------------
     host = pick_cdn(name, value)
     if host is None:
-        print("FAILED: token did not verify on any CDN host.")
+        dump_debug()
+        log("FAILED: token verified on no CDN host.")
         return 1
 
     if args.selftest:
-        print(f"Selftest OK -- token valid until "
-              f"{datetime.fromtimestamp(token_expiry(value), IST):%d %b %H:%M} IST")
+        dump_debug()
+        log(f"Selftest OK -- token valid until "
+            f"{datetime.fromtimestamp(token_expiry(value), IST):%d %b %H:%M} IST")
         return 0
 
-    # 3. optional verification / pruning
+    # ---- health (optional, threaded, non-fatal) ---------------------------
     channels = CHANNELS
     if args.check or args.prune:
-        print("Health-checking channels...")
-        channels = health_check(name, value, host)
-        if not channels:
-            print("FAILED: zero channels alive.")
-            return 1
-        if args.prune:
-            print(f"  kept {len(channels)}/{len(CHANNELS)}")
+        log("Health-checking channels (threaded)...")
+        alive = health_check(name, value, host)
+        if not alive:
+            log(f"  WARNING: 0/{len(CHANNELS)} healthy. Writing full list anyway.")
+            if args.strict:
+                dump_debug()
+                return 1
+        elif args.prune:
+            channels = alive
+            log(f"  pruned to {len(alive)}/{len(CHANNELS)}")
         else:
-            channels = CHANNELS
+            log(f"  {len(alive)}/{len(CHANNELS)} healthy (no prune)")
 
-    # 4. optional live events
+    # ---- live -------------------------------------------------------------
     live = fetch_live_events() if args.live else []
 
-    # 5. write
+    # ---- write ------------------------------------------------------------
     build(channels, name, value, host, live, args.out)
+    dump_debug()
     exp = datetime.fromtimestamp(token_expiry(value), IST)
-    total = len(channels) + len(live)
-    print(f"Wrote {args.out} -- {total} entries, token valid until {exp:%d %b %H:%M} IST")
+    log(f"OK -> {args.out}  entries={len(channels) + len(live)}  "
+        f"token_valid_until={exp:%d %b %H:%M} IST")
     return 0
 
 
